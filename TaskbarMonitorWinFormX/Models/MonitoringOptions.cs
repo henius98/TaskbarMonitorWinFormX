@@ -9,4 +9,5 @@ public sealed record MonitoringOptions
     public int GraphWidth { get; init; } = 14;
     public int GraphHeight { get; init; } = 14;
     public int GraphPadding { get; init; } = 1;
+    public int IconCacheBucketSize { get; init; } = 5; // Cache icons in 5% buckets
 }
