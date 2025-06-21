@@ -26,6 +26,11 @@ public sealed class TaskbarMonitor : IDisposable
     private readonly ConcurrentQueue<Icon> _iconDisposalQueue = new();
     private readonly System.Threading.Timer _disposalTimer;
 
+    // Performance optimization: Debounce rapid updates
+    private readonly object _debouncelock = new();
+    private volatile bool _updatePending;
+    private SystemMetrics _pendingMetrics = SystemMetrics.Empty;
+
     private bool _disposed;
     private volatile bool _isInitialized;
 
@@ -43,12 +48,12 @@ public sealed class TaskbarMonitor : IDisposable
         // Capture UI synchronization context
         _uiContext = SynchronizationContext.Current;
 
-        // Timer for safe icon disposal (every 5 seconds)
+        // Timer for safe icon disposal (every 3 seconds)
         _disposalTimer = new System.Threading.Timer(
             DisposeQueuedIcons,
             null,
-            TimeSpan.FromSeconds(5),
-            TimeSpan.FromSeconds(5));
+            TimeSpan.FromSeconds(3),
+            TimeSpan.FromSeconds(3));
     }
 
     public void Initialize()
@@ -77,7 +82,7 @@ public sealed class TaskbarMonitor : IDisposable
 
     private void CreateNotifyIcons()
     {
-        var emptyHistory = CreateEmptyHistory();
+        using var emptyHistory = CreateEmptyHistory();
 
         _cpuNotifyIcon = new NotifyIcon
         {
@@ -99,8 +104,6 @@ public sealed class TaskbarMonitor : IDisposable
             Visible = true,
             Text = "Network: Initializing..."
         };
-
-        emptyHistory.Dispose();
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -108,7 +111,7 @@ public sealed class TaskbarMonitor : IDisposable
     {
         var history = new MetricsHistory(_options.HistorySize);
         // Add some initial zero values for empty graph display
-        for (int i = 0; i < 5; i++)
+        for (int i = 0; i < Math.Min(5, _options.HistorySize); i++)
             history.Add(0);
         return history;
     }
@@ -118,9 +121,17 @@ public sealed class TaskbarMonitor : IDisposable
         _contextMenu = new ContextMenuStrip();
         _contextMenu.Items.Add(CreateMenuItem("Show Details", OnShowDetails));
         _contextMenu.Items.Add(new ToolStripSeparator());
+        _contextMenu.Items.Add(CreateMenuItem("Refresh Now", OnRefreshNow));
+        _contextMenu.Items.Add(new ToolStripSeparator());
         _contextMenu.Items.Add(CreateMenuItem("Exit All", OnExitAll));
 
-        // Assign context menus
+        // Assign context menus to all icons
+        AssignContextMenus();
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void AssignContextMenus()
+    {
         if (_cpuNotifyIcon != null)
             _cpuNotifyIcon.ContextMenuStrip = _contextMenu;
         if (_ramNotifyIcon != null)
@@ -141,6 +152,7 @@ public sealed class TaskbarMonitor : IDisposable
     {
         _metricsService.MetricsUpdated += OnMetricsUpdated;
 
+        // Subscribe to double-click events
         if (_cpuNotifyIcon != null)
             _cpuNotifyIcon.DoubleClick += OnShowDetails;
         if (_ramNotifyIcon != null)
@@ -150,26 +162,52 @@ public sealed class TaskbarMonitor : IDisposable
     }
 
     /// <summary>
-    /// Thread-safe metrics update with proper icon lifecycle management
+    /// Thread-safe metrics update with debouncing to prevent UI flooding
     /// </summary>
     private void OnMetricsUpdated(object? sender, SystemMetrics metrics)
     {
         if (_disposed || !_isInitialized) return;
 
-        // Marshal to UI thread if needed
+        // Update pending metrics atomically
+        lock (_debouncelock)
+        {
+            _pendingMetrics = metrics;
+
+            if (_updatePending) return; // Already scheduled
+
+            _updatePending = true;
+        }
+
+        // Marshal to UI thread with debouncing
         if (_uiContext != null && _uiContext != SynchronizationContext.Current)
         {
-            _uiContext.Post(_ => UpdateIconsSafe(metrics), null);
+            _uiContext.Post(_ => ProcessPendingUpdate(), null);
         }
         else
         {
-            UpdateIconsSafe(metrics);
+            ProcessPendingUpdate();
         }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void ProcessPendingUpdate()
+    {
+        SystemMetrics metricsToProcess;
+
+        lock (_debouncelock)
+        {
+            metricsToProcess = _pendingMetrics;
+            _updatePending = false;
+        }
+
+        UpdateIconsSafe(metricsToProcess);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void UpdateIconsSafe(SystemMetrics metrics)
     {
+        if (_disposed || !_isInitialized) return;
+
         try
         {
             lock (_updateLock)
@@ -180,23 +218,21 @@ public sealed class TaskbarMonitor : IDisposable
                 var ramHistory = _metricsService.GetRamHistory();
                 var networkHistory = _metricsService.GetNetworkHistory();
 
-                // Update CPU icon with safe disposal
+                // Update icons with batched operations for better performance
                 UpdateNotifyIcon(
                     _cpuNotifyIcon,
                     () => _iconGeneratorService.GenerateCpuIcon(cpuHistory),
-                    $"CPU: {metrics.CpuUsagePercent}%");
+                    $"CPU: {metrics.CpuUsagePercent}%\nClick for details");
 
-                // Update RAM icon with safe disposal
                 UpdateNotifyIcon(
                     _ramNotifyIcon,
                     () => _iconGeneratorService.GenerateRamIcon(ramHistory),
-                    $"RAM: {metrics.RamUsagePercent}%");
+                    $"RAM: {metrics.RamUsagePercent}%\nClick for details");
 
-                // Update Network icon with safe disposal
                 UpdateNotifyIcon(
                     _networkNotifyIcon,
                     () => _iconGeneratorService.GenerateNetworkIcon(networkHistory, _options.NetworkThresholdMbps),
-                    $"Network: {metrics.NetworkSpeedMbps} MB/s");
+                    $"Network: {metrics.NetworkSpeedMbps} MB/s\nAvg: {metrics.AverageNetworkSpeedMbps} MB/s\nClick for details");
             }
         }
         catch (Exception ex)
@@ -208,14 +244,245 @@ public sealed class TaskbarMonitor : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void UpdateNotifyIcon(NotifyIcon? notifyIcon, Func<Icon> iconFactory, string text)
     {
-        if (notifyIcon == null) return;
+        if (notifyIcon == null || _disposed) return;
 
-        var oldIcon = notifyIcon.Icon;
-        var newIcon = iconFactory();
+        try
+        {
+            var oldIcon = notifyIcon.Icon;
+            var newIcon = iconFactory();
 
-        // Atomic update
-        notifyIcon.Icon = newIcon;
-        notifyIcon.Text = text;
+            // Atomic update to prevent race conditions
+            notifyIcon.Icon = newIcon;
+            notifyIcon.Text = TruncateTooltipText(text);
 
-        // Queue old icon for safe disposal
-        if (oldIcon !=
+            // Queue old icon for safe disposal (avoid immediate disposal which can cause issues)
+            if (oldIcon != null)
+            {
+                _iconDisposalQueue.Enqueue(oldIcon);
+            }
+        }
+        catch (Exception ex)
+        {
+            LogError(ex, "Error updating individual notify icon");
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static string TruncateTooltipText(string text)
+    {
+        // Windows tooltip limit is 127 characters
+        return text.Length > 127 ? text[..124] + "..." : text;
+    }
+
+    /// <summary>
+    /// Safely dispose queued icons on background thread to prevent UI blocking
+    /// </summary>
+    private void DisposeQueuedIcons(object? state)
+    {
+        if (_disposed) return;
+
+        var disposedCount = 0;
+        const int maxDisposalsPerCycle = 10; // Limit to prevent long blocking
+
+        try
+        {
+            while (_iconDisposalQueue.TryDequeue(out var icon) && disposedCount < maxDisposalsPerCycle)
+            {
+                try
+                {
+                    icon.Dispose();
+                    disposedCount++;
+                }
+                catch (Exception ex)
+                {
+                    LogError(ex, "Error disposing queued icon");
+                }
+            }
+
+            if (disposedCount > 0)
+            {
+                LogDebug($"Disposed {disposedCount} queued icons");
+            }
+        }
+        catch (Exception ex)
+        {
+            LogError(ex, "Error in icon disposal timer");
+        }
+    }
+
+    #region Event Handlers
+
+    private void OnShowDetails(object? sender, EventArgs e)
+    {
+        try
+        {
+            var currentMetrics = _metricsService.GetCurrentMetrics();
+            var detailsText = $"""
+                System Resource Monitor
+                ====================================
+                
+                CPU Usage: {currentMetrics.CpuUsagePercent}%
+                RAM Usage: {currentMetrics.RamUsagePercent}%
+                Network Speed: {currentMetrics.NetworkSpeedMbps} MB/s
+                Average Network: {currentMetrics.AverageNetworkSpeedMbps} MB/s
+                
+                Last Updated: {currentMetrics.Timestamp:HH:mm:ss}
+                Update Interval: {_options.UpdateIntervalMs}ms
+                History Size: {_options.HistorySize} samples
+                """;
+
+            MessageBox.Show(detailsText, "System Monitor Details",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            LogError(ex, "Error showing details dialog");
+            MessageBox.Show("Error retrieving system details.", "Error",
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private void OnRefreshNow(object? sender, EventArgs e)
+    {
+        try
+        {
+            // Force immediate update
+            var currentMetrics = _metricsService.GetCurrentMetrics();
+            UpdateIconsSafe(currentMetrics);
+
+            LogInformation("Manual refresh completed");
+        }
+        catch (Exception ex)
+        {
+            LogError(ex, "Error during manual refresh");
+        }
+    }
+
+    private void OnExitAll(object? sender, EventArgs e)
+    {
+        try
+        {
+            LogInformation("Exit requested by user");
+            Application.Exit();
+        }
+        catch (Exception ex)
+        {
+            LogError(ex, "Error during application exit");
+            Environment.Exit(1);
+        }
+    }
+
+    #endregion
+
+    #region Optimized Logging
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void LogInformation(string message)
+    {
+        if (_logger.IsEnabled(LogLevel.Information))
+            _logger.LogInformation(message);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void LogDebug(string message)
+    {
+        if (_logger.IsEnabled(LogLevel.Debug))
+            _logger.LogDebug(message);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void LogError(Exception ex, string message)
+    {
+        if (_logger.IsEnabled(LogLevel.Error))
+            _logger.LogError(ex, message);
+    }
+
+    #endregion
+
+    #region IDisposable
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+
+        try
+        {
+            LogInformation("Disposing taskbar monitor");
+
+            _disposed = true;
+            _isInitialized = false;
+
+            // Stop monitoring first
+            _metricsService.StopMonitoring();
+
+            // Dispose timer
+            _disposalTimer?.Dispose();
+
+            // Unsubscribe from events
+            _metricsService.MetricsUpdated -= OnMetricsUpdated;
+
+            // Dispose UI components
+            DisposeNotifyIcons();
+            _contextMenu?.Dispose();
+
+            // Dispose all remaining queued icons
+            DisposeAllQueuedIcons();
+
+            LogInformation("Taskbar monitor disposed successfully");
+        }
+        catch (Exception ex)
+        {
+            LogError(ex, "Error during TaskbarMonitor disposal");
+        }
+        finally
+        {
+            GC.SuppressFinalize(this);
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void DisposeNotifyIcons()
+    {
+        try
+        {
+            _cpuNotifyIcon?.Dispose();
+            _ramNotifyIcon?.Dispose();
+            _networkNotifyIcon?.Dispose();
+        }
+        catch (Exception ex)
+        {
+            LogError(ex, "Error disposing notify icons");
+        }
+    }
+
+    private void DisposeAllQueuedIcons()
+    {
+        var disposedCount = 0;
+        try
+        {
+            while (_iconDisposalQueue.TryDequeue(out var icon))
+            {
+                try
+                {
+                    icon.Dispose();
+                    disposedCount++;
+                }
+                catch (Exception ex)
+                {
+                    LogError(ex, "Error disposing final queued icon");
+                }
+            }
+
+            if (disposedCount > 0)
+            {
+                LogDebug($"Disposed {disposedCount} remaining icons during cleanup");
+            }
+        }
+        catch (Exception ex)
+        {
+            LogError(ex, "Error disposing all queued icons");
+        }
+    }
+
+    #endregion
+}
