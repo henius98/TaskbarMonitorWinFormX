@@ -136,7 +136,7 @@ public sealed class TaskbarMonitor : IDisposable
             {
                 var oldIcon = _cpuNotifyIcon.Icon;
                 _cpuNotifyIcon.Icon = _iconGeneratorService.GenerateCpuIcon(cpuHistory);
-                _cpuNotifyIcon.Text = $"CPU: {metrics.CpuUsagePercent:F1}%";
+                _cpuNotifyIcon.Text = $"CPU: {metrics.CpuUsagePercent}%";
                 oldIcon?.Dispose();
             }
 
@@ -145,7 +145,7 @@ public sealed class TaskbarMonitor : IDisposable
             {
                 var oldIcon = _ramNotifyIcon.Icon;
                 _ramNotifyIcon.Icon = _iconGeneratorService.GenerateRamIcon(ramHistory);
-                _ramNotifyIcon.Text = $"RAM: {metrics.RamUsagePercent:F1}%";
+                _ramNotifyIcon.Text = $"RAM: {metrics.RamUsagePercent}%";
                 oldIcon?.Dispose();
             }
 
@@ -154,7 +154,7 @@ public sealed class TaskbarMonitor : IDisposable
             {
                 var oldIcon = _networkNotifyIcon.Icon;
                 _networkNotifyIcon.Icon = _iconGeneratorService.GenerateNetworkIcon(networkHistory, _options.NetworkThresholdMbps);
-                _networkNotifyIcon.Text = $"Network: {metrics.NetworkSpeedMbps:F1} MB/s";
+                _networkNotifyIcon.Text = $"Network: {metrics.NetworkSpeedMbps} MB/s";
                 oldIcon?.Dispose();
             }
         }
@@ -170,10 +170,10 @@ public sealed class TaskbarMonitor : IDisposable
         var message = $"""
             System Resource Monitor
             
-            CPU Usage: {metrics.CpuUsagePercent:F1}%
-            RAM Usage: {metrics.RamUsagePercent:F1}%
-            Network Speed: {metrics.NetworkSpeedMbps:F2} MB/s
-            Avg Network Speed: {metrics.AverageNetworkSpeedMbps:F2} MB/s
+            CPU Usage: {metrics.CpuUsagePercent}%
+            RAM Usage: {metrics.RamUsagePercent}%
+            Network Speed: {metrics.NetworkSpeedMbps} MB/s
+            Avg Network Speed: {metrics.AverageNetworkSpeedMbps} MB/s
             
             Last Updated: {metrics.Timestamp:HH:mm:ss}
             """;
