@@ -1,5 +1,4 @@
-﻿using System.Drawing.Drawing2D;
-using TaskbarMonitorWinFormX.Models;
+﻿using TaskbarMonitorWinFormX.Models;
 
 namespace TaskbarMonitorWinFormX.Services;
 
@@ -7,109 +6,75 @@ public interface IIconGeneratorService
 {
     Icon GenerateCpuIcon(MetricsHistory cpuHistory);
     Icon GenerateRamIcon(MetricsHistory ramHistory);
-    Icon GenerateNetworkIcon(MetricsHistory networkHistory, float threshold);
+    Icon GenerateNetworkIcon(MetricsHistory networkHistory, int threshold);
+    Icon GenerateIcon(MetricsHistory history, SolidBrush brush, int maxValue);
 }
 
 public sealed class IconGeneratorService : IIconGeneratorService
 {
     private readonly MonitoringOptions _options;
-
-    private static readonly Color BackgroundColor = Color.FromArgb(200, 40, 40, 40);
-    private static readonly Color BorderColor = Color.FromArgb(255, 80, 80, 80);
-    private static readonly Color CpuColor = Color.FromArgb(255, 255, 100, 100);
-    private static readonly Color RamColor = Color.FromArgb(255, 100, 255, 100);
-    private static readonly Color NetworkColor = Color.FromArgb(255, 100, 150, 255);
+    private readonly SolidBrush _cpuBrush = new(Color.FromArgb(255, 80, 80));
+    private readonly SolidBrush _ramBrush = new(Color.FromArgb(80, 255, 80));
+    private readonly SolidBrush _netBrush = new(Color.FromArgb(80, 160, 255));
+    private readonly SolidBrush _blackBrush = new(Color.Black);
 
     public IconGeneratorService(MonitoringOptions options)
     {
         _options = options;
     }
 
-    public Icon GenerateCpuIcon(MetricsHistory cpuHistory)
-    {
-        return GenerateIcon(cpuHistory, CpuColor, 100f);
-    }
+    public Icon GenerateCpuIcon(MetricsHistory cpuHistory) =>
+        GenerateIcon(cpuHistory, _cpuBrush, 100);
 
-    public Icon GenerateRamIcon(MetricsHistory ramHistory)
-    {
-        return GenerateIcon(ramHistory, RamColor, 100f);
-    }
+    public Icon GenerateRamIcon(MetricsHistory ramHistory) =>
+        GenerateIcon(ramHistory, _ramBrush, 100);
 
-    public Icon GenerateNetworkIcon(MetricsHistory networkHistory, float threshold)
-    {
-        return GenerateIcon(networkHistory, NetworkColor, threshold);
-    }
+    public Icon GenerateNetworkIcon(MetricsHistory networkHistory, int threshold) =>
+        GenerateIcon(networkHistory, _netBrush, threshold);
 
-    private Icon GenerateIcon(MetricsHistory history, Color graphColor, float maxValue)
+    public Icon GenerateIcon(MetricsHistory history, SolidBrush brush, int maxValue)
     {
-        using var bitmap = new Bitmap(_options.IconSize, _options.IconSize);
-        using var graphics = Graphics.FromImage(bitmap);
+        var bitmap = new Bitmap(_options.IconSize, _options.IconSize);
+        using var g = Graphics.FromImage(bitmap);
 
-        ConfigureGraphics(graphics);
-        DrawBackground(graphics);
-        DrawGraph(graphics, history, graphColor, maxValue);
-        DrawBorder(graphics);
+        g.CompositingMode = System.Drawing.Drawing2D.CompositingMode.SourceCopy;
+        g.CompositingQuality = System.Drawing.Drawing2D.CompositingQuality.HighSpeed;
+        g.FillRectangle(_blackBrush, 0, 0, _options.IconSize, _options.IconSize);
+
+        var values = history.Values;
+        if (values.Length == 0) return Icon.FromHandle(bitmap.GetHicon());
+
+        var width = _options.IconSize;
+        var height = _options.IconSize;
+
+        if (values.Length == 1)
+        {
+            var barHeight = (values[0] * height) / maxValue;
+            if (barHeight > 0 && barHeight <= height)
+                g.FillRectangle(brush, 0, height - barHeight, width, barHeight);
+        }
+        else
+        {
+            var step = width / values.Length;
+            for (int i = 0; i < values.Length; i++)
+            {
+                var x = i * step;
+                var colWidth = Math.Max(1, step);
+                var barHeight = (values[i] * height) / maxValue;
+
+                if (barHeight > 0 && barHeight <= height)
+                    g.FillRectangle(brush, x, height - barHeight, colWidth, barHeight);
+            }
+        }
 
         return Icon.FromHandle(bitmap.GetHicon());
     }
 
-    private void ConfigureGraphics(Graphics graphics)
+    public void Dispose()
     {
-        graphics.SmoothingMode = SmoothingMode.AntiAlias;
-        graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
-        graphics.CompositingQuality = CompositingQuality.HighSpeed;
-        graphics.Clear(Color.Transparent);
-    }
-
-    private void DrawBackground(Graphics graphics)
-    {
-        using var brush = new SolidBrush(BackgroundColor);
-        graphics.FillRectangle(brush, 0, 0, _options.IconSize, _options.IconSize);
-    }
-
-    private void DrawGraph(Graphics graphics, MetricsHistory history, Color graphColor, float maxValue)
-    {
-        var values = history.Values.ToArray();
-        if (values.Length < 2) return;
-
-        var graphRect = new Rectangle(
-            _options.GraphPadding,
-            _options.GraphPadding,
-            _options.GraphWidth,
-            _options.GraphHeight);
-
-        using var pen = new Pen(graphColor, 1.0f);
-
-        // Calculate points for the graph
-        var points = new List<PointF>();
-        for (int i = 0; i < values.Length; i++)
-        {
-            var x = graphRect.X + (float)i / (values.Length - 1) * graphRect.Width;
-            var normalizedValue = Math.Clamp(values[i] / maxValue, 0f, 1f);
-            var y = graphRect.Bottom - (normalizedValue * graphRect.Height);
-            points.Add(new PointF(x, y));
-        }
-
-        // Draw the graph line
-        if (points.Count > 1)
-        {
-            graphics.DrawLines(pen, points.ToArray());
-        }
-
-        // Fill area under the curve for better visibility
-        if (points.Count > 1)
-        {
-            using var fillBrush = new SolidBrush(Color.FromArgb(80, graphColor));
-            var fillPoints = new List<PointF>(points);
-            fillPoints.Add(new PointF(points.Last().X, graphRect.Bottom));
-            fillPoints.Add(new PointF(points.First().X, graphRect.Bottom));
-            graphics.FillPolygon(fillBrush, fillPoints.ToArray());
-        }
-    }
-
-    private void DrawBorder(Graphics graphics)
-    {
-        using var pen = new Pen(BorderColor);
-        graphics.DrawRectangle(pen, 0, 0, _options.IconSize - 1, _options.IconSize - 1);
+        _cpuBrush?.Dispose();
+        _ramBrush?.Dispose();
+        _netBrush?.Dispose();
+        _blackBrush?.Dispose();
     }
 }

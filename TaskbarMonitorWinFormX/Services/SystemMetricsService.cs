@@ -21,11 +21,9 @@ public sealed class SystemMetricsService : ISystemMetricsService
     private readonly ILogger<SystemMetricsService> _logger;
     private readonly MonitoringOptions _options;
     private readonly System.Threading.Timer _updateTimer;
-
     private readonly MetricsHistory _cpuHistory;
     private readonly MetricsHistory _ramHistory;
     private readonly MetricsHistory _networkHistory;
-
     private bool _disposed;
     private volatile bool _isMonitoring;
 
@@ -40,13 +38,10 @@ public sealed class SystemMetricsService : ISystemMetricsService
         _performanceCounterService = performanceCounterService;
         _logger = logger;
         _options = options;
-
         _cpuHistory = new MetricsHistory(_options.HistorySize);
         _ramHistory = new MetricsHistory(_options.HistorySize);
         _networkHistory = new MetricsHistory(_options.HistorySize);
-
-        _updateTimer = new System.Threading.Timer(UpdateMetrics, null,
-            Timeout.Infinite, Timeout.Infinite);
+        _updateTimer = new System.Threading.Timer(UpdateMetrics, null, Timeout.Infinite, Timeout.Infinite);
     }
 
     public MetricsHistory GetCpuHistory() => _cpuHistory;
@@ -55,13 +50,7 @@ public sealed class SystemMetricsService : ISystemMetricsService
 
     public void StartMonitoring()
     {
-        if (_isMonitoring || !_performanceCounterService.IsInitialized)
-        {
-            _logger.LogWarning("Cannot start monitoring - already running or counters not initialized");
-            return;
-        }
-
-        _logger.LogInformation("Starting system metrics monitoring");
+        if (_isMonitoring || !_performanceCounterService.IsInitialized) return;
         _isMonitoring = true;
         _updateTimer.Change(0, _options.UpdateIntervalMs);
     }
@@ -69,33 +58,22 @@ public sealed class SystemMetricsService : ISystemMetricsService
     public void StopMonitoring()
     {
         if (!_isMonitoring) return;
-
-        _logger.LogInformation("Stopping system metrics monitoring");
         _isMonitoring = false;
         _updateTimer.Change(Timeout.Infinite, Timeout.Infinite);
     }
 
     public SystemMetrics GetCurrentMetrics()
     {
-        if (!_performanceCounterService.IsInitialized)
-        {
-            return SystemMetrics.Empty;
-        }
-
-        return new SystemMetrics(
-            _cpuHistory.Current,
-            _ramHistory.Current,
-            _networkHistory.Current,
-            _networkHistory.Average,
-            DateTime.UtcNow);
+        if (!_performanceCounterService.IsInitialized) return SystemMetrics.Empty;
+        return new SystemMetrics(_cpuHistory.Current, _ramHistory.Current,
+            _networkHistory.Current, _networkHistory.Average, DateTime.UtcNow);
     }
 
     private void UpdateMetrics(object? state)
     {
         try
         {
-            if (!_isMonitoring || !_performanceCounterService.IsInitialized)
-                return;
+            if (!_isMonitoring || !_performanceCounterService.IsInitialized) return;
 
             var cpu = _performanceCounterService.GetCpuUsage();
             var ram = _performanceCounterService.GetRamUsagePercent();
@@ -105,35 +83,21 @@ public sealed class SystemMetricsService : ISystemMetricsService
             _ramHistory.Add(ram);
             _networkHistory.Add(network);
 
-            var metrics = new SystemMetrics(
-                cpu, ram, network, _networkHistory.Average, DateTime.UtcNow);
-
-            // Invoke on UI thread if needed
-            if (SynchronizationContext.Current != null)
-            {
-                SynchronizationContext.Current.Post(_ => MetricsUpdated?.Invoke(this, metrics), null);
-            }
-            else
-            {
-                MetricsUpdated?.Invoke(this, metrics);
-            }
-
-            _logger.LogDebug("Metrics updated: {Metrics}", metrics);
+            var metrics = new SystemMetrics(cpu, ram, network, _networkHistory.Average, DateTime.UtcNow);
+            MetricsUpdated?.Invoke(this, metrics);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error updating system metrics");
+            _logger.LogError(ex, "Error updating metrics");
         }
     }
 
     public void Dispose()
     {
         if (_disposed) return;
-
         StopMonitoring();
         _updateTimer?.Dispose();
         _performanceCounterService?.Dispose();
-
         _disposed = true;
     }
 }

@@ -57,7 +57,7 @@ internal static class Program
                 {
                     UpdateIntervalMs = 1000,
                     HistorySize = 60,
-                    NetworkThresholdMbps = 10.0f
+                    NetworkThresholdMbps = 300
                 });
             })
             .ConfigureLogging(logging =>
