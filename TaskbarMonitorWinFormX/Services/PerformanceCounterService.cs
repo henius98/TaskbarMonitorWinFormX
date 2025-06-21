@@ -1,5 +1,6 @@
 ﻿using System.Diagnostics;
 using System.Net.NetworkInformation;
+using TaskbarMonitorWinFormX.Models;
 
 namespace TaskbarMonitorWinFormX.Services;
 
@@ -7,7 +8,8 @@ public interface IPerformanceCounterService : IDisposable
 {
     int GetCpuUsage();
     int GetRamUsagePercent();
-    int GetNetworkSpeedMbps();
+    int GetNetworkSpeedMbps(); // Returns bytes per second
+    NetworkStats GetDetailedNetworkStats(); // New method for detailed stats
     bool IsInitialized { get; }
 }
 
@@ -19,9 +21,15 @@ public sealed class PerformanceCounterService : IPerformanceCounterService
     private PerformanceCounter? _networkReceivedCounter;
     private readonly int _totalRamMb;
     private bool _disposed;
+    private string _selectedNetworkInterface = "";
+
+    // Keep track of previous values for rate calculation
+    private long _previousSentBytes = 0;
+    private long _previousReceivedBytes = 0;
+    private DateTime _previousMeasurement = DateTime.MinValue;
 
     public bool IsInitialized { get; private set; }
-
+    int dummyInt= 0; // Dummy variable to avoid unused field warning
     public PerformanceCounterService()
     {
         try
@@ -44,36 +52,60 @@ public sealed class PerformanceCounterService : IPerformanceCounterService
     {
         try
         {
+            // Get active network interfaces with better selection logic
             var activeInterfaces = NetworkInterface.GetAllNetworkInterfaces()
                 .Where(ni => ni.OperationalStatus == OperationalStatus.Up &&
-                           ni.NetworkInterfaceType != NetworkInterfaceType.Loopback)
+                           ni.NetworkInterfaceType != NetworkInterfaceType.Loopback &&
+                           ni.NetworkInterfaceType != NetworkInterfaceType.Tunnel)
+                .OrderByDescending(ni => ni.Speed) // Prefer higher speed interfaces
                 .ToList();
 
             var perfCounterInstances = new PerformanceCounterCategory("Network Interface")
                 .GetInstanceNames()
-                .Where(name => !name.Contains("Loopback") && !name.StartsWith("_"))
+                .Where(name => !name.Contains("Loopback") &&
+                              !name.StartsWith("_") &&
+                              !name.Contains("Teredo") &&
+                              !name.Contains("isatap"))
                 .ToList();
 
-            var selectedInstance = perfCounterInstances.FirstOrDefault();
+            // Try to match active interfaces with performance counter instances
+            var selectedInstance = perfCounterInstances
+                .FirstOrDefault(instance => activeInterfaces
+                    .Any(iface => SanitizeInterfaceName(iface.Name).Contains(SanitizeInterfaceName(instance)) ||
+                                 SanitizeInterfaceName(instance).Contains(SanitizeInterfaceName(iface.Name))));
+
+            selectedInstance ??= perfCounterInstances.FirstOrDefault();
+
             if (selectedInstance != null)
             {
                 _networkSentCounter = new PerformanceCounter("Network Interface", "Bytes Sent/sec", selectedInstance);
                 _networkReceivedCounter = new PerformanceCounter("Network Interface", "Bytes Received/sec", selectedInstance);
+
+                // Initialize counters (first call often returns 0)
                 _networkSentCounter.NextValue();
                 _networkReceivedCounter.NextValue();
+
+                _selectedNetworkInterface = selectedInstance;
+
+                // Wait a bit for initial measurement
+                Thread.Sleep(100);
             }
         }
-        catch
+        catch (Exception ex)
         {
-            // Network counters are optional
+            // Log the exception if you have logging available
+            System.Diagnostics.Debug.WriteLine($"Network counter initialization failed: {ex.Message}");
         }
     }
+
+    private static string SanitizeInterfaceName(string name) =>
+        name.Replace(" ", "").Replace("-", "").Replace("(", "").Replace(")", "").ToLowerInvariant();
 
     public int GetCpuUsage()
     {
         try
         {
-            return (int)(_cpuCounter?.NextValue() ?? 0);
+            return Math.Min(100, Math.Max(0, (int)(_cpuCounter?.NextValue() ?? 0)));
         }
         catch
         {
@@ -87,7 +119,8 @@ public sealed class PerformanceCounterService : IPerformanceCounterService
         {
             if (_ramCounter == null || _totalRamMb == 0) return 0;
             var availableRam = (int)_ramCounter.NextValue();
-            return (((_totalRamMb - availableRam) * 100) / _totalRamMb);
+            var usedPercent = (((_totalRamMb - availableRam) * 100) / _totalRamMb);
+            return Math.Min(100, Math.Max(0, usedPercent));
         }
         catch
         {
@@ -95,18 +128,53 @@ public sealed class PerformanceCounterService : IPerformanceCounterService
         }
     }
 
-    public int GetNetworkSpeedMbps()
+    public int GetNetworkSpeedBps()
+    {
+        var stats = GetDetailedNetworkStats();
+        return stats.TotalBps;
+    }
+
+    public NetworkStats GetDetailedNetworkStats()
     {
         try
         {
-            if (_networkSentCounter == null || _networkReceivedCounter == null) return 0;
-            var sent = (int)_networkSentCounter.NextValue();
-            var received = (int)_networkReceivedCounter.NextValue();
-            return (sent + received) / (1024 * 1024);
+            if (_networkSentCounter == null || _networkReceivedCounter == null)
+                return new NetworkStats(0, 0, 0, "None");
+
+            // Get current values
+            var currentSent = (int)_networkSentCounter.NextValue();
+            var currentReceived = (int)_networkReceivedCounter.NextValue();
+            var currentTime = DateTime.UtcNow;
+
+            int uploadBps = 0, downloadBps = 0;
+
+            // Calculate rates if we have previous measurements
+            if (_previousMeasurement != DateTime.MinValue)
+            {
+                var timeDiff = (int)(currentTime - _previousMeasurement).TotalSeconds;
+                if (timeDiff > 0)
+                {
+                    var sentDiff = (int)Math.Max(0, currentSent - _previousSentBytes);
+                    var receivedDiff = (int)Math.Max(0, currentReceived - _previousReceivedBytes);
+
+                    // Keep original bytes/sec values
+                    uploadBps = (sentDiff / timeDiff);
+                    downloadBps = (receivedDiff / timeDiff);
+                }
+            }
+
+            // Store current values for next calculation
+            _previousSentBytes = currentSent;
+            _previousReceivedBytes = currentReceived;
+            _previousMeasurement = currentTime;
+
+            var totalMBps = (uploadBps + downloadBps) / 1048576; // 1 MB = 1024 * 1024 bytes
+            return new NetworkStats(uploadBps, downloadBps, totalMBps, _selectedNetworkInterface);
         }
-        catch
+        catch (Exception ex)
         {
-            return 0;
+            System.Diagnostics.Debug.WriteLine($"Network stats error: {ex.Message}");
+            return new NetworkStats(0, 0, 0, "Error");
         }
     }
 

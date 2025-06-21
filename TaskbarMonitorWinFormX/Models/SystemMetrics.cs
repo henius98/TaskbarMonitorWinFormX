@@ -40,3 +40,5 @@ public sealed class MetricsHistory
     public int[] Values => _values.Take(_count).ToArray();
     public int Count => _count;
 }
+
+public record NetworkStats(int UploadBps, int DownloadBps, int TotalBps, string InterfaceName);
