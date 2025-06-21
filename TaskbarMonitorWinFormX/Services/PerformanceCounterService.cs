@@ -8,7 +8,7 @@ public interface IPerformanceCounterService : IDisposable
 {
     int GetCpuUsage();
     int GetRamUsagePercent();
-    int GetNetworkSpeedMbps(); // Returns bytes per second
+    int GetNetworkSpeedMBps(); // Returns bytes per second
     NetworkStats GetDetailedNetworkStats(); // New method for detailed stats
     bool IsInitialized { get; }
 }
@@ -128,7 +128,7 @@ public sealed class PerformanceCounterService : IPerformanceCounterService
         }
     }
 
-    public int GetNetworkSpeedBps()
+    public int GetNetworkSpeedMBps()
     {
         var stats = GetDetailedNetworkStats();
         return stats.TotalBps;

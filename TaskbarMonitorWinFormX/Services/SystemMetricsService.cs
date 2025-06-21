@@ -77,7 +77,7 @@ public sealed class SystemMetricsService : ISystemMetricsService
 
             var cpu = _performanceCounterService.GetCpuUsage();
             var ram = _performanceCounterService.GetRamUsagePercent();
-            var network = _performanceCounterService.GetNetworkSpeedMbps();
+            var network = _performanceCounterService.GetNetworkSpeedMBps();
 
             _cpuHistory.Add(cpu);
             _ramHistory.Add(ram);
