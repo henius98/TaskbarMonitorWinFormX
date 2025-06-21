@@ -5,7 +5,9 @@ namespace TaskbarMonitorWinFormX.Services;
 
 public interface IIconGeneratorService
 {
-    Icon GenerateIcon(SystemMetrics metrics);
+    Icon GenerateCpuIcon(MetricsHistory cpuHistory);
+    Icon GenerateRamIcon(MetricsHistory ramHistory);
+    Icon GenerateNetworkIcon(MetricsHistory networkHistory, float threshold);
 }
 
 public sealed class IconGeneratorService : IIconGeneratorService
@@ -23,14 +25,29 @@ public sealed class IconGeneratorService : IIconGeneratorService
         _options = options;
     }
 
-    public Icon GenerateIcon(SystemMetrics metrics)
+    public Icon GenerateCpuIcon(MetricsHistory cpuHistory)
+    {
+        return GenerateIcon(cpuHistory, CpuColor, 100f);
+    }
+
+    public Icon GenerateRamIcon(MetricsHistory ramHistory)
+    {
+        return GenerateIcon(ramHistory, RamColor, 100f);
+    }
+
+    public Icon GenerateNetworkIcon(MetricsHistory networkHistory, float threshold)
+    {
+        return GenerateIcon(networkHistory, NetworkColor, threshold);
+    }
+
+    private Icon GenerateIcon(MetricsHistory history, Color graphColor, float maxValue)
     {
         using var bitmap = new Bitmap(_options.IconSize, _options.IconSize);
         using var graphics = Graphics.FromImage(bitmap);
 
         ConfigureGraphics(graphics);
         DrawBackground(graphics);
-        DrawMetricsBars(graphics, metrics);
+        DrawGraph(graphics, history, graphColor, maxValue);
         DrawBorder(graphics);
 
         return Icon.FromHandle(bitmap.GetHicon());
@@ -50,38 +67,44 @@ public sealed class IconGeneratorService : IIconGeneratorService
         graphics.FillRectangle(brush, 0, 0, _options.IconSize, _options.IconSize);
     }
 
-    private void DrawMetricsBars(Graphics graphics, SystemMetrics metrics)
+    private void DrawGraph(Graphics graphics, MetricsHistory history, Color graphColor, float maxValue)
     {
-        var barPositions = CalculateBarPositions();
+        var values = history.Values.ToArray();
+        if (values.Length < 2) return;
 
-        DrawBar(graphics, barPositions[0], metrics.CpuUsagePercent, 100f, CpuColor);
-        DrawBar(graphics, barPositions[1], metrics.RamUsagePercent, 100f, RamColor);
-        DrawBar(graphics, barPositions[2], metrics.NetworkSpeedMbps, _options.NetworkThresholdMbps, NetworkColor);
-    }
+        var graphRect = new Rectangle(
+            _options.GraphPadding,
+            _options.GraphPadding,
+            _options.GraphWidth,
+            _options.GraphHeight);
 
-    private int[] CalculateBarPositions()
-    {
-        var totalBarsWidth = _options.BarCount * _options.BarWidth + (_options.BarCount - 1) * _options.BarSpacing;
-        var startX = (_options.IconSize - totalBarsWidth) / 2;
+        using var pen = new Pen(graphColor, 1.0f);
 
-        var positions = new int[_options.BarCount];
-        for (var i = 0; i < _options.BarCount; i++)
+        // Calculate points for the graph
+        var points = new List<PointF>();
+        for (int i = 0; i < values.Length; i++)
         {
-            positions[i] = startX + i * (_options.BarWidth + _options.BarSpacing);
+            var x = graphRect.X + (float)i / (values.Length - 1) * graphRect.Width;
+            var normalizedValue = Math.Clamp(values[i] / maxValue, 0f, 1f);
+            var y = graphRect.Bottom - (normalizedValue * graphRect.Height);
+            points.Add(new PointF(x, y));
         }
 
-        return positions;
-    }
+        // Draw the graph line
+        if (points.Count > 1)
+        {
+            graphics.DrawLines(pen, points.ToArray());
+        }
 
-    private void DrawBar(Graphics graphics, int x, float value, float maxValue, Color color)
-    {
-        var normalizedValue = Math.Clamp(value / maxValue, 0f, 1f);
-        var barHeight = (int)(normalizedValue * (_options.IconSize - 2));
-
-        if (barHeight <= 0) return;
-
-        using var brush = new SolidBrush(color);
-        graphics.FillRectangle(brush, x, _options.IconSize - 1 - barHeight, _options.BarWidth, barHeight);
+        // Fill area under the curve for better visibility
+        if (points.Count > 1)
+        {
+            using var fillBrush = new SolidBrush(Color.FromArgb(80, graphColor));
+            var fillPoints = new List<PointF>(points);
+            fillPoints.Add(new PointF(points.Last().X, graphRect.Bottom));
+            fillPoints.Add(new PointF(points.First().X, graphRect.Bottom));
+            graphics.FillPolygon(fillBrush, fillPoints.ToArray());
+        }
     }
 
     private void DrawBorder(Graphics graphics)

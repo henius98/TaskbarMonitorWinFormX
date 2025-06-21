@@ -1,4 +1,5 @@
 ﻿using System.Diagnostics;
+using System.Net.NetworkInformation;
 
 namespace TaskbarMonitorWinFormX.Services;
 
@@ -18,6 +19,7 @@ public sealed class PerformanceCounterService : IPerformanceCounterService
     private PerformanceCounter? _networkReceivedCounter;
     private readonly long _totalRamMb;
     private bool _disposed;
+    private string? _selectedNetworkInterface;
 
     public bool IsInitialized { get; private set; }
 
@@ -31,13 +33,14 @@ public sealed class PerformanceCounterService : IPerformanceCounterService
             // Get total RAM
             _totalRamMb = (long)(new Microsoft.VisualBasic.Devices.ComputerInfo().TotalPhysicalMemory / (1024 * 1024));
 
-            // Initialize network counters
+            // Initialize network counters with better detection
             InitializeNetworkCounters();
 
             IsInitialized = true;
         }
-        catch (Exception)
+        catch (Exception ex)
         {
+            System.Diagnostics.Debug.WriteLine($"PerformanceCounterService initialization failed: {ex.Message}");
             IsInitialized = false;
             Dispose();
         }
@@ -47,22 +50,92 @@ public sealed class PerformanceCounterService : IPerformanceCounterService
     {
         try
         {
-            var networkInterface = new PerformanceCounterCategory("Network Interface")
-                .GetInstanceNames()
-                .FirstOrDefault(name =>
-                    !name.Contains("Loopback", StringComparison.OrdinalIgnoreCase) &&
-                    !name.Contains("Teredo", StringComparison.OrdinalIgnoreCase) &&
-                    !name.Contains("isatap", StringComparison.OrdinalIgnoreCase));
+            // Get active network interfaces from .NET
+            var activeInterfaces = NetworkInterface.GetAllNetworkInterfaces()
+                .Where(ni => ni.OperationalStatus == OperationalStatus.Up &&
+                           ni.NetworkInterfaceType != NetworkInterfaceType.Loopback &&
+                           ni.NetworkInterfaceType != NetworkInterfaceType.Tunnel)
+                .ToList();
 
-            if (!string.IsNullOrEmpty(networkInterface))
+            // Get performance counter instance names
+            var perfCounterInstances = new PerformanceCounterCategory("Network Interface")
+                .GetInstanceNames()
+                .Where(name => !name.Contains("Loopback", StringComparison.OrdinalIgnoreCase) &&
+                              !name.Contains("Teredo", StringComparison.OrdinalIgnoreCase) &&
+                              !name.Contains("isatap", StringComparison.OrdinalIgnoreCase) &&
+                              !name.StartsWith("_") &&
+                              name != "MS TCP Loopback interface")
+                .ToList();
+
+            System.Diagnostics.Debug.WriteLine($"Found {activeInterfaces.Count} active interfaces");
+            System.Diagnostics.Debug.WriteLine($"Found {perfCounterInstances.Count} performance counter instances");
+
+            foreach (var instance in perfCounterInstances)
             {
-                _networkSentCounter = new PerformanceCounter("Network Interface", "Bytes Sent/sec", networkInterface);
-                _networkReceivedCounter = new PerformanceCounter("Network Interface", "Bytes Received/sec", networkInterface);
+                System.Diagnostics.Debug.WriteLine($"Performance counter instance: {instance}");
+            }
+
+            // Try to match active interfaces with performance counter instances
+            string? selectedInstance = null;
+
+            // First try: exact name match
+            foreach (var activeInterface in activeInterfaces)
+            {
+                var matchingInstance = perfCounterInstances.FirstOrDefault(pi =>
+                    pi.Equals(activeInterface.Name, StringComparison.OrdinalIgnoreCase));
+                if (matchingInstance != null)
+                {
+                    selectedInstance = matchingInstance;
+                    break;
+                }
+            }
+
+            // Second try: partial name match
+            if (selectedInstance == null)
+            {
+                foreach (var activeInterface in activeInterfaces)
+                {
+                    var matchingInstance = perfCounterInstances.FirstOrDefault(pi =>
+                        pi.Contains(activeInterface.Name, StringComparison.OrdinalIgnoreCase) ||
+                        activeInterface.Name.Contains(pi, StringComparison.OrdinalIgnoreCase));
+                    if (matchingInstance != null)
+                    {
+                        selectedInstance = matchingInstance;
+                        break;
+                    }
+                }
+            }
+
+            // Third try: just use the first available instance that looks like a real network adapter
+            if (selectedInstance == null && perfCounterInstances.Any())
+            {
+                selectedInstance = perfCounterInstances.FirstOrDefault(pi =>
+                    !pi.Contains("Virtual", StringComparison.OrdinalIgnoreCase) &&
+                    !pi.Contains("VPN", StringComparison.OrdinalIgnoreCase)) ??
+                    perfCounterInstances.First();
+            }
+
+            if (!string.IsNullOrEmpty(selectedInstance))
+            {
+                _selectedNetworkInterface = selectedInstance;
+                _networkSentCounter = new PerformanceCounter("Network Interface", "Bytes Sent/sec", selectedInstance);
+                _networkReceivedCounter = new PerformanceCounter("Network Interface", "Bytes Received/sec", selectedInstance);
+
+                System.Diagnostics.Debug.WriteLine($"Selected network interface: {selectedInstance}");
+
+                // Initialize counters with first reading
+                _networkSentCounter.NextValue();
+                _networkReceivedCounter.NextValue();
+            }
+            else
+            {
+                System.Diagnostics.Debug.WriteLine("No suitable network interface found");
             }
         }
-        catch
+        catch (Exception ex)
         {
-            // Network counters are optional
+            System.Diagnostics.Debug.WriteLine($"Network counter initialization failed: {ex.Message}");
+            // Network counters are optional, don't fail the entire service
         }
     }
 
@@ -72,8 +145,9 @@ public sealed class PerformanceCounterService : IPerformanceCounterService
         {
             return _cpuCounter?.NextValue() ?? 0f;
         }
-        catch
+        catch (Exception ex)
         {
+            System.Diagnostics.Debug.WriteLine($"CPU counter error: {ex.Message}");
             return 0f;
         }
     }
@@ -87,8 +161,9 @@ public sealed class PerformanceCounterService : IPerformanceCounterService
             var availableRam = _ramCounter.NextValue();
             return (((_totalRamMb - availableRam) / _totalRamMb) * 100f);
         }
-        catch
+        catch (Exception ex)
         {
+            System.Diagnostics.Debug.WriteLine($"RAM counter error: {ex.Message}");
             return 0f;
         }
     }
@@ -97,14 +172,23 @@ public sealed class PerformanceCounterService : IPerformanceCounterService
     {
         try
         {
-            if (_networkSentCounter == null || _networkReceivedCounter == null) return 0f;
+            if (_networkSentCounter == null || _networkReceivedCounter == null)
+            {
+                System.Diagnostics.Debug.WriteLine($"Network counters not available. Interface: {_selectedNetworkInterface ?? "None"}");
+                return 0f;
+            }
 
             var sent = _networkSentCounter.NextValue();
             var received = _networkReceivedCounter.NextValue();
-            return (sent + received) / (1024f * 1024f); // Convert to MB/s
+            var totalBytes = sent + received;
+            var totalMB = totalBytes / (1024f * 1024f); // Convert to MB/s
+
+            System.Diagnostics.Debug.WriteLine($"Network: {totalMB:F2} MB/s (Sent: {sent / 1024 / 1024:F2}, Received: {received / 1024 / 1024:F2})");
+            return totalMB;
         }
-        catch
+        catch (Exception ex)
         {
+            System.Diagnostics.Debug.WriteLine($"Network counter error: {ex.Message}");
             return 0f;
         }
     }

@@ -1,12 +1,14 @@
 ﻿using Microsoft.Extensions.Logging;
 using TaskbarMonitorWinFormX.Models;
-using TaskbarMonitorWinFormX.Services;
 
 namespace TaskbarMonitorWinFormX.Services;
 
 public interface ISystemMetricsService : IDisposable
 {
     SystemMetrics GetCurrentMetrics();
+    MetricsHistory GetCpuHistory();
+    MetricsHistory GetRamHistory();
+    MetricsHistory GetNetworkHistory();
     event EventHandler<SystemMetrics>? MetricsUpdated;
     void StartMonitoring();
     void StopMonitoring();
@@ -46,6 +48,10 @@ public sealed class SystemMetricsService : ISystemMetricsService
         _updateTimer = new System.Threading.Timer(UpdateMetrics, null,
             Timeout.Infinite, Timeout.Infinite);
     }
+
+    public MetricsHistory GetCpuHistory() => _cpuHistory;
+    public MetricsHistory GetRamHistory() => _ramHistory;
+    public MetricsHistory GetNetworkHistory() => _networkHistory;
 
     public void StartMonitoring()
     {
