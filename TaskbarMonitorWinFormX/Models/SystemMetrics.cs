@@ -88,25 +88,45 @@ public sealed class MetricsHistory : IDisposable
 }
 
 // High-performance object pool for bitmaps
+// High-performance object pool for bitmaps - FIXED VERSION
 public sealed class BitmapPool : IDisposable
 {
     private readonly ObjectPool<Bitmap> _pool;
     private readonly int _size;
+    private readonly object _disposalLock = new();
+    private bool _disposed;
 
     public BitmapPool(int size, int initialCapacity = 8)
     {
         _size = size;
         _pool = new DefaultObjectPool<Bitmap>(
             new BitmapPoolPolicy(size),
-            initialCapacity);
+            Math.Min(initialCapacity, 32)); // Cap the initial capacity
     }
 
-    public PooledBitmap Rent() => new(_pool.Get(), _pool);
+    public PooledBitmap Rent()
+    {
+        lock (_disposalLock)
+        {
+            if (_disposed)
+                throw new ObjectDisposedException(nameof(BitmapPool));
+
+            return new PooledBitmap(_pool.Get(), _pool);
+        }
+    }
 
     public void Dispose()
     {
-        if (_pool is IDisposable disposable)
-            disposable.Dispose();
+        lock (_disposalLock)
+        {
+            if (_disposed) return;
+            _disposed = true;
+
+            if (_pool is IDisposable disposable)
+                disposable.Dispose();
+        }
+
+        GC.SuppressFinalize(this);
     }
 
     private sealed class BitmapPoolPolicy : IPooledObjectPolicy<Bitmap>
@@ -119,15 +139,27 @@ public sealed class BitmapPool : IDisposable
 
         public bool Return(Bitmap obj)
         {
-            // Clear the bitmap for reuse
-            using var g = Graphics.FromImage(obj);
-            g.Clear(Color.Transparent);
-            return true;
+            if (obj == null || obj.Width != _size || obj.Height != _size)
+                return false;
+
+            try
+            {
+                // Clear the bitmap for reuse with safer approach
+                using var g = Graphics.FromImage(obj);
+                g.Clear(Color.Transparent);
+                return true;
+            }
+            catch
+            {
+                // If clearing fails, don't return to pool
+                obj?.Dispose();
+                return false;
+            }
         }
     }
 }
 
-// RAII wrapper for pooled bitmaps
+// RAII wrapper for pooled bitmaps - FIXED VERSION
 public readonly struct PooledBitmap : IDisposable
 {
     private readonly Bitmap _bitmap;
@@ -141,7 +173,18 @@ public readonly struct PooledBitmap : IDisposable
 
     public Bitmap Bitmap => _bitmap;
 
-    public void Dispose() => _pool.Return(_bitmap);
+    public void Dispose()
+    {
+        try
+        {
+            _pool?.Return(_bitmap);
+        }
+        catch
+        {
+            // If return fails, dispose the bitmap directly
+            _bitmap?.Dispose();
+        }
+    }
 }
 
 // Icon cache for reducing GC pressure
@@ -150,6 +193,10 @@ public sealed class IconCache : IDisposable
     private readonly Dictionary<IconCacheKey, Icon> _cache = new();
     private readonly object _lock = new();
     private readonly int _bucketSize;
+    private bool _disposed;
+
+    // Limit cache size to prevent memory issues
+    private const int MaxCacheSize = 100;
 
     public IconCache(int bucketSize = 5)
     {
@@ -162,8 +209,32 @@ public sealed class IconCache : IDisposable
 
         lock (_lock)
         {
+            if (_disposed)
+                return factory(); // Don't cache if disposed
+
             if (_cache.TryGetValue(key, out var cachedIcon))
                 return cachedIcon;
+
+            // Limit cache size
+            if (_cache.Count >= MaxCacheSize)
+            {
+                // Remove oldest entries (simple LRU approximation)
+                var keysToRemove = _cache.Keys.Take(_cache.Count - MaxCacheSize + 10).ToList();
+                foreach (var keyToRemove in keysToRemove)
+                {
+                    if (_cache.Remove(keyToRemove, out var iconToDispose))
+                    {
+                        try
+                        {
+                            iconToDispose?.Dispose();
+                        }
+                        catch
+                        {
+                            // Ignore disposal errors
+                        }
+                    }
+                }
+            }
 
             var newIcon = factory();
             _cache[key] = newIcon;
@@ -179,7 +250,16 @@ public sealed class IconCache : IDisposable
         lock (_lock)
         {
             foreach (var icon in _cache.Values)
-                icon.Dispose();
+            {
+                try
+                {
+                    icon?.Dispose();
+                }
+                catch
+                {
+                    // Ignore disposal errors during clearing
+                }
+            }
             _cache.Clear();
         }
     }

@@ -26,6 +26,9 @@ namespace TaskbarMonitorWinFormX.Services
         // Pre-allocated buffer for rendering values
         private readonly int[] _renderBuffer;
 
+        // Thread safety
+        private readonly object _generationLock = new();
+
         public IconGeneratorService(MonitoringOptions options)
         {
             _options = options;
@@ -54,12 +57,17 @@ namespace TaskbarMonitorWinFormX.Services
         {
             var currentValue = history.Current;
 
-            return _iconCache.GetOrCreate(currentValue, type, () =>
-                GenerateIconCore(history, brush, maxValue));
+            // Thread-safe cache access
+            lock (_generationLock)
+            {
+                return _iconCache.GetOrCreate(currentValue, type, () =>
+                    GenerateIconCore(history, brush, maxValue));
+            }
         }
 
         /// <summary>
         /// High-performance icon generation with object pooling and span operations
+        /// Fixed GDI resource management to prevent leaks
         /// </summary>
         private Icon GenerateIconCore(MetricsHistory history, SolidBrush brush, int maxValue)
         {
@@ -68,22 +76,24 @@ namespace TaskbarMonitorWinFormX.Services
             using var pooledBitmap = _bitmapPool.Rent();
             var bitmap = pooledBitmap.Bitmap;
 
-            using var g = Graphics.FromImage(bitmap);
+            // Create graphics with proper disposal
+            using (var g = Graphics.FromImage(bitmap))
+            {
+                // Optimize graphics settings for performance
+                g.CompositingMode = System.Drawing.Drawing2D.CompositingMode.SourceCopy;
+                g.CompositingQuality = System.Drawing.Drawing2D.CompositingQuality.HighSpeed;
+                g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.NearestNeighbor;
+                g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.None;
 
-            // Optimize graphics settings for performance
-            g.CompositingMode = System.Drawing.Drawing2D.CompositingMode.SourceCopy;
-            g.CompositingQuality = System.Drawing.Drawing2D.CompositingQuality.HighSpeed;
-            g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.NearestNeighbor;
-            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.None;
+                // Clear background
+                g.FillRectangle(_blackBrush, 0, 0, size, size);
 
-            // Clear background
-            g.FillRectangle(_blackBrush, 0, 0, size, size);
+                // Render bars using span operations
+                RenderBarsOptimized(history, g, brush, maxValue, size);
+            }
 
-            // Render bars using span operations
-            RenderBarsOptimized(history, g, brush, maxValue, size);
-
-            // Create safe icon copy
-            return CreateSafeIcon(bitmap);
+            // Create safe icon copy with proper resource management
+            return CreateSafeIconFixed(bitmap);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -117,18 +127,38 @@ namespace TaskbarMonitorWinFormX.Services
             }
         }
 
+        /// <summary>
+        /// Fixed icon creation with proper resource management to prevent GDI leaks
+        /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static Icon CreateSafeIcon(Bitmap bitmap)
+        private static Icon CreateSafeIconFixed(Bitmap bitmap)
         {
-            var hIcon = bitmap.GetHicon();
+            IntPtr hIcon = IntPtr.Zero;
             try
             {
-                var tempIcon = Icon.FromHandle(hIcon);
-                return (Icon)tempIcon.Clone();
+                hIcon = bitmap.GetHicon();
+
+                // Create icon from handle
+                using var tempIcon = Icon.FromHandle(hIcon);
+
+                // Create a proper copy that owns its resources
+                var iconData = new byte[0];
+                using (var ms = new MemoryStream())
+                {
+                    tempIcon.Save(ms);
+                    iconData = ms.ToArray();
+                }
+
+                using var iconStream = new MemoryStream(iconData);
+                return new Icon(iconStream);
             }
             finally
             {
-                DestroyIcon(hIcon);
+                // Always destroy the HICON handle to prevent GDI leaks
+                if (hIcon != IntPtr.Zero)
+                {
+                    DestroyIcon(hIcon);
+                }
             }
         }
 
@@ -142,15 +172,21 @@ namespace TaskbarMonitorWinFormX.Services
         {
             if (_disposed) return;
 
-            _cpuBrush.Dispose();
-            _ramBrush.Dispose();
-            _netBrush.Dispose();
-            _blackBrush.Dispose();
+            lock (_generationLock)
+            {
+                if (_disposed) return;
 
-            _bitmapPool.Dispose();
-            _iconCache.Dispose();
+                _cpuBrush.Dispose();
+                _ramBrush.Dispose();
+                _netBrush.Dispose();
+                _blackBrush.Dispose();
 
-            _disposed = true;
+                _bitmapPool.Dispose();
+                _iconCache.Dispose();
+
+                _disposed = true;
+            }
+
             GC.SuppressFinalize(this);
         }
 
